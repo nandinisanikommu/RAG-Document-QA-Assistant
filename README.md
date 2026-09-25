@@ -33,27 +33,27 @@ The system combines **dense vector retrieval, BM25 keyword retrieval, Reciprocal
                              ▼
                   ┌──────────────────────┐
                   │    PDF Extraction    │
-                  │      PyPDFLoader      │
+                  │     PyPDFLoader      │
                   └──────────┬───────────┘
                              │
                              ▼
                   ┌──────────────────────┐
-                  │  Text Chunking       │
-                  │  Chunk = 1000        │
-                  │  Overlap = 200       │
+                  │    Text Chunking     │
+                  │    Chunk = 1000      │
+                  │    Overlap = 200     │
                   └──────────┬───────────┘
                              │
-                ┌────────────┴────────────┐
-                │                         │
-                ▼                         ▼
-      ┌──────────────────┐      ┌──────────────────┐
-      │ Dense Retrieval  │      │ Sparse Retrieval │
-      │ ChromaDB         │      │ BM25Okapi        │
-      │ MiniLM Embedding │      │ Keyword Search   │
-      └────────┬─────────┘      └────────┬─────────┘
-               │                         │
-               └────────────┬────────────┘
-                            ▼
+               ┌─────────────┴─────────────┐
+               │                           │
+               ▼                           ▼
+      ┌──────────────────┐       ┌──────────────────┐
+      │ Dense Retrieval  │       │ Sparse Retrieval │
+      │ ChromaDB         │       │ BM25Okapi        │
+      │ MiniLM Embedding │       │ Keyword Search   │
+      └────────┬─────────┘       └────────┬─────────┘
+               │                          │
+               └─────────────┬────────────┘
+                             ▼
                   ┌──────────────────────┐
                   │ Reciprocal Rank      │
                   │ Fusion (RRF)         │
@@ -62,7 +62,7 @@ The system combines **dense vector retrieval, BM25 keyword retrieval, Reciprocal
                              ▼
                   ┌──────────────────────┐
                   │ Cross-Encoder        │
-                  │ Reranking             │
+                  │ Reranking            │
                   └──────────┬───────────┘
                              │
                              ▼
@@ -73,7 +73,7 @@ The system combines **dense vector retrieval, BM25 keyword retrieval, Reciprocal
                              ▼
                   ┌──────────────────────┐
                   │ Llama 3.2 3B         │
-                  │ Ollama                │
+                  │ Ollama               │
                   └──────────┬───────────┘
                              │
                              ▼
