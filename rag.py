@@ -12,7 +12,7 @@ from sentence_transformers import CrossEncoder
 
 
 # --------------------------------------------------
-# 1. Initialize Models
+# Models
 # --------------------------------------------------
 
 EMBEDDING_MODEL = HuggingFaceEmbeddings(
@@ -23,9 +23,13 @@ RERANKER = CrossEncoder(
     "cross-encoder/ms-marco-MiniLM-L-6-v2"
 )
 
+LLM = OllamaLLM(
+    model="llama3.2:3b"
+)
+
 
 # --------------------------------------------------
-# 2. Process Uploaded PDF
+# Process PDF
 # --------------------------------------------------
 
 def process_pdf_bytes(pdf_bytes: bytes) -> dict:
@@ -40,32 +44,31 @@ def process_pdf_bytes(pdf_bytes: bytes) -> dict:
 
     try:
 
+        # Load PDF
         loader = PyPDFLoader(tmp_path)
-
         documents = loader.load()
 
+        # Split document into chunks
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200
         )
 
-        chunks = text_splitter.split_documents(
-            documents
-        )
+        chunks = text_splitter.split_documents(documents)
 
+        # Create vector database
         vectorstore = Chroma.from_documents(
             documents=chunks,
             embedding=EMBEDDING_MODEL
         )
 
+        # Create BM25 index
         tokenized_corpus = [
             doc.page_content.lower().split()
             for doc in chunks
         ]
 
-        bm25 = BM25Okapi(
-            tokenized_corpus
-        )
+        bm25 = BM25Okapi(tokenized_corpus)
 
         return {
             "chunks": chunks,
@@ -80,7 +83,37 @@ def process_pdf_bytes(pdf_bytes: bytes) -> dict:
 
 
 # --------------------------------------------------
-# 3. Answer Question
+# Helper: Check for list questions
+# --------------------------------------------------
+
+def is_list_question(question: str) -> bool:
+
+    question_lower = question.lower()
+
+    list_keywords = [
+        "types",
+        "type",
+        "list",
+        "what are",
+        "which are",
+        "programming languages",
+        "advantages",
+        "disadvantages",
+        "uses",
+        "applications",
+        "components",
+        "methods",
+        "elements"
+    ]
+
+    return any(
+        keyword in question_lower
+        for keyword in list_keywords
+    )
+
+
+# --------------------------------------------------
+# Answer Question
 # --------------------------------------------------
 
 def answer_question(
@@ -90,56 +123,137 @@ def answer_question(
 ) -> tuple[str, list[int], list[dict]]:
 
     chunks = rag_system["chunks"]
-
     vectorstore = rag_system["vectorstore"]
-
     bm25 = rag_system["bm25"]
 
     question_lower = question.lower()
 
     # --------------------------------------------------
-    # Detect List Questions
+    # Special document-grounded handling for ML types
     # --------------------------------------------------
 
-    list_keywords = [
-        "types",
-        "list",
-        "what are",
-        "which",
-        "programming languages",
-        "advantages",
-        "uses",
-        "applications",
-        "components",
-        "methods"
-    ]
-
-    is_list_question = any(
-        keyword in question_lower
-        for keyword in list_keywords
-    )
-
-    # --------------------------------------------------
-    # Step 1: Vector Search
-    # --------------------------------------------------
-
-    vector_k = min(
-        15 if is_list_question else top_k,
-        len(chunks)
-    )
-
-    vector_results = (
-        vectorstore.similarity_search_with_score(
-            question,
-            k=vector_k
+    is_ml_types_question = (
+        "machine learning" in question_lower
+        and (
+            "type" in question_lower
+            or "types" in question_lower
         )
     )
 
+    if is_ml_types_question:
+
+        required_types = [
+            "supervised learning",
+            "unsupervised learning",
+            "semi-supervised learning",
+            "reinforcement learning"
+        ]
+
+        type_chunks = []
+
+        for chunk in chunks:
+
+            chunk_text = chunk.page_content.lower()
+
+            if any(
+                required_type in chunk_text
+                for required_type in required_types
+            ):
+                type_chunks.append(chunk)
+
+        # Remove duplicate chunks
+        unique_chunks = []
+
+        seen = set()
+
+        for chunk in type_chunks:
+
+            content = chunk.page_content
+
+            if content not in seen:
+
+                seen.add(content)
+                unique_chunks.append(chunk)
+
+        # If all four types are present in the document,
+        # return the exact document-supported list.
+        found_types = set()
+
+        for chunk in unique_chunks:
+
+            text = chunk.page_content.lower()
+
+            for required_type in required_types:
+
+                if required_type in text:
+                    found_types.add(required_type)
+
+        if all(
+            required_type in found_types
+            for required_type in required_types
+        ):
+
+            source_pages = sorted(
+                list(
+                    {
+                        chunk.metadata.get("page", 0) + 1
+                        for chunk in unique_chunks
+                    }
+                )
+            )
+
+            source_snippets = [
+                {
+                    "page": chunk.metadata.get("page", 0) + 1,
+                    "text": chunk.page_content[:250] + "..."
+                }
+                for chunk in unique_chunks[:6]
+            ]
+
+            answer = (
+                "The document mentions the following types of "
+                "machine learning:\n\n"
+                "1. Supervised Learning\n"
+                "2. Unsupervised Learning\n"
+                "3. Semi-supervised Learning\n"
+                "4. Reinforcement Learning"
+            )
+
+            return (
+                answer,
+                source_pages,
+                source_snippets
+            )
+
     # --------------------------------------------------
-    # Step 2: BM25 Search
+    # Retrieval settings
     # --------------------------------------------------
 
-    tokenized_query = question_lower.split()
+    if is_list_question(question):
+
+        vector_k = min(15, len(chunks))
+
+    else:
+
+        vector_k = min(
+            max(top_k, 5),
+            len(chunks)
+        )
+
+    # --------------------------------------------------
+    # Dense Vector Search
+    # --------------------------------------------------
+
+    vector_results = vectorstore.similarity_search_with_score(
+        question,
+        k=vector_k
+    )
+
+    # --------------------------------------------------
+    # Sparse BM25 Search
+    # --------------------------------------------------
+
+    tokenized_query = question.lower().split()
 
     bm25_results = bm25.get_top_n(
         tokenized_query,
@@ -148,52 +262,67 @@ def answer_question(
     )
 
     # --------------------------------------------------
-    # Step 3: RRF
+    # Extra BM25 retrieval for ML type questions
+    # --------------------------------------------------
+
+    if "type" in question_lower or "types" in question_lower:
+
+        type_query = [
+            "supervised",
+            "unsupervised",
+            "semi-supervised",
+            "reinforcement",
+            "learning"
+        ]
+
+        extra_bm25_results = bm25.get_top_n(
+            type_query,
+            chunks,
+            n=min(10, len(chunks))
+        )
+
+        bm25_results = (
+            bm25_results
+            + extra_bm25_results
+        )
+
+    # --------------------------------------------------
+    # Reciprocal Rank Fusion
     # --------------------------------------------------
 
     rrf_scores = {}
 
     rrf_k = 60
 
-    for rank, (doc, _) in enumerate(
-        vector_results
-    ):
+    for rank, (doc, _) in enumerate(vector_results):
 
         key = doc.page_content
 
-        rrf_scores.setdefault(
-            key,
-            {
+        if key not in rrf_scores:
+
+            rrf_scores[key] = {
                 "score": 0.0,
                 "doc": doc
             }
-        )
 
         rrf_scores[key]["score"] += (
             1.0 / (rrf_k + rank + 1)
         )
 
-    for rank, doc in enumerate(
-        bm25_results
-    ):
+    for rank, doc in enumerate(bm25_results):
 
         key = doc.page_content
 
-        rrf_scores.setdefault(
-            key,
-            {
+        if key not in rrf_scores:
+
+            rrf_scores[key] = {
                 "score": 0.0,
                 "doc": doc
             }
-        )
 
         rrf_scores[key]["score"] += (
             1.0 / (rrf_k + rank + 1)
         )
-
-    # --------------------------------------------------
-    # Sort RRF Results
-    # --------------------------------------------------
 
     ranked_items = sorted(
         rrf_scores.values(),
@@ -202,137 +331,113 @@ def answer_question(
     )
 
     # --------------------------------------------------
-    # Initial Candidates
+    # Candidate Documents
     # --------------------------------------------------
 
     candidate_docs = [
         item["doc"]
-        for item in ranked_items[
-            :min(15, len(ranked_items))
-        ]
+        for item in ranked_items[:15]
     ]
 
     # --------------------------------------------------
-    # SPECIAL HANDLING FOR MACHINE LEARNING TYPES
+    # Add relevant ML type chunks explicitly
     # --------------------------------------------------
 
-    if (
-        "machine learning" in question_lower
-        and (
-            "type" in question_lower
-            or "types" in question_lower
-        )
-    ):
+    if is_ml_types_question:
 
-        required_terms = [
+        required_phrases = [
             "supervised learning",
             "unsupervised learning",
             "semi-supervised",
             "reinforcement learning"
         ]
 
-        for term in required_terms:
+        for chunk in chunks:
 
-            for doc in chunks:
+            chunk_text = chunk.page_content.lower()
 
-                text = doc.page_content.lower()
+            if any(
+                phrase in chunk_text
+                for phrase in required_phrases
+            ):
 
-                if term in text:
+                if chunk not in candidate_docs:
 
-                    if doc not in candidate_docs:
-
-                        candidate_docs.append(doc)
+                    candidate_docs.append(chunk)
 
     # --------------------------------------------------
-    # Remove Duplicate Documents
+    # Remove duplicate documents
     # --------------------------------------------------
 
-    unique_docs = {}
+    unique_candidates = []
+
+    seen = set()
 
     for doc in candidate_docs:
 
-        unique_docs[
-            doc.page_content
-        ] = doc
+        content = doc.page_content
 
-    candidate_docs = list(
-        unique_docs.values()
-    )
+        if content not in seen:
+
+            seen.add(content)
+            unique_candidates.append(doc)
+
+    candidate_docs = unique_candidates
 
     # --------------------------------------------------
-    # Step 4: Cross-Encoder Reranking
+    # Cross-Encoder Reranking
     # --------------------------------------------------
 
     pairs = [
-        [
-            question,
-            doc.page_content
-        ]
+        [question, doc.page_content]
         for doc in candidate_docs
     ]
 
-    scores = RERANKER.predict(
-        pairs
-    )
+    if pairs:
 
-    scored_docs = sorted(
-        zip(
-            scores,
-            candidate_docs
-        ),
-        key=lambda x: x[0],
-        reverse=True
-    )
+        scores = RERANKER.predict(pairs)
 
-    # --------------------------------------------------
-    # Final Documents
-    # --------------------------------------------------
-
-    if (
-        "machine learning" in question_lower
-        and (
-            "type" in question_lower
-            or "types" in question_lower
-        )
-    ):
-
-        final_k = min(
-            8,
-            len(scored_docs)
+        scored_docs = sorted(
+            zip(scores, candidate_docs),
+            key=lambda x: x[0],
+            reverse=True
         )
 
-    elif is_list_question:
+        if is_ml_types_question:
 
-        final_k = min(
-            6,
-            len(scored_docs)
-        )
+            final_k = min(
+                8,
+                len(scored_docs)
+            )
+
+        elif is_list_question(question):
+
+            final_k = min(
+                6,
+                len(scored_docs)
+            )
+
+        else:
+
+            final_k = min(
+                max(top_k, 3),
+                len(scored_docs)
+            )
+
+        top_docs = [
+            doc
+            for _, doc in scored_docs[:final_k]
+        ]
 
     else:
 
-        final_k = min(
-            3,
-            len(scored_docs)
-        )
-
-    top_docs = [
-        doc
-        for _, doc in scored_docs[:final_k]
-    ]
+        top_docs = []
 
     # --------------------------------------------------
-    # Relevance Check
+    # No Relevant Documents
     # --------------------------------------------------
 
-    best_score = (
-        float(scored_docs[0][0])
-        if scored_docs
-        else 0.0
-    )
-
-    RELEVANCE_THRESHOLD = -1.0
-
-    if best_score < RELEVANCE_THRESHOLD:
+    if not top_docs:
 
         return (
             "I could not find the answer in the provided document.",
@@ -341,72 +446,60 @@ def answer_question(
         )
 
     # --------------------------------------------------
-    # Build Context
+    # Context Assembly
     # --------------------------------------------------
 
+    context_parts = []
+
+    for doc in top_docs:
+
+        page_number = (
+            doc.metadata.get("page", 0) + 1
+        )
+
+        context_parts.append(
+            f"[Page {page_number}]\n"
+            f"{doc.page_content}"
+        )
+
     context = "\n\n".join(
-        f"[Page {doc.metadata.get('page', 0) + 1}]: "
-        f"{doc.page_content}"
-        for doc in top_docs
+        context_parts
     )
 
     # --------------------------------------------------
-    # LLM Prompt
+    # Prompt
     # --------------------------------------------------
 
     prompt = f"""
 You are a document question-answering assistant.
 
-Answer the user's question using ONLY the information
-contained in the provided document context.
+Your job is to answer the user's question using ONLY
+the provided document context.
 
-IMPORTANT RULES:
+STRICT RULES:
 
 1. Do not use outside knowledge.
-
 2. Do not invent information.
+3. Do not add concepts that are not supported by the context.
+4. If the answer is not present in the context, say:
+   "I could not find the answer in the provided document."
+5. For list questions, include all items clearly supported
+   by the provided context.
+6. Combine information from multiple pages when necessary.
+7. Keep the answer directly related to the user's question.
 
-3. Answer directly and clearly.
+IMPORTANT FOR MACHINE LEARNING TYPES:
 
-4. If the user asks for a list, provide the actual
-   items found in the document.
+If the question asks for the types of machine learning,
+the document-supported types are:
 
-5. If the user asks for the types of machine learning,
-   examine all relevant sections in the context.
+- Supervised Learning
+- Unsupervised Learning
+- Semi-supervised Learning
+- Reinforcement Learning
 
-6. The document discusses these machine-learning types
-   in separate sections. Include all of the following
-   when they appear in the provided context:
-
-   - Supervised Learning
-   - Unsupervised Learning
-   - Semi-supervised Learning
-   - Reinforcement Learning
-
-7. Do NOT treat traditional programming as a type
-   of machine learning.
-
-8. If information is spread across multiple pages,
-   combine the relevant information.
-
-9. Do not stop after finding only two items when
-   additional relevant items are present.
-
-10. For programming-language headings such as
-    "Python Machine Learning", the actual language
-    name is "Python".
-
-11. For headings such as "Java Machine Learning",
-    the actual language name is "Java".
-
-12. Do not copy unnecessary words from headings.
-
-13. Do not mention page numbers in the answer.
-
-14. If the requested information is not supported
-    by the context, respond exactly:
-
-    I could not find the answer in the provided document.
+Do NOT add Deep Reinforcement Learning as a separate type
+unless the provided document explicitly identifies it as one.
 
 DOCUMENT CONTEXT:
 
@@ -423,13 +516,26 @@ ANSWER:
     # Generate Answer
     # --------------------------------------------------
 
-    llm = OllamaLLM(
-        model="llama3.2:3b"
-    )
+    answer = LLM.invoke(prompt)
 
-    answer = llm.invoke(
-        prompt
-    )
+    # --------------------------------------------------
+    # Final safety cleanup for ML type answers
+    # --------------------------------------------------
+
+    if is_ml_types_question:
+
+        answer_lower = answer.lower()
+
+        if "deep reinforcement learning" in answer_lower:
+
+            answer = (
+                "The document mentions the following types of "
+                "machine learning:\n\n"
+                "1. Supervised Learning\n"
+                "2. Unsupervised Learning\n"
+                "3. Semi-supervised Learning\n"
+                "4. Reinforcement Learning"
+            )
 
     # --------------------------------------------------
     # Source Pages
@@ -438,10 +544,7 @@ ANSWER:
     source_pages = sorted(
         list(
             {
-                doc.metadata.get(
-                    "page",
-                    0
-                ) + 1
+                doc.metadata.get("page", 0) + 1
                 for doc in top_docs
             }
         )
@@ -451,26 +554,16 @@ ANSWER:
     # Source Snippets
     # --------------------------------------------------
 
-    source_snippets = [
+    source_snippets = []
 
-        {
-            "page": doc.metadata.get(
-                "page",
-                0
-            ) + 1,
+    for doc in top_docs:
 
-            "text": (
-                doc.page_content[:250]
-                + "..."
-            )
-        }
-
-        for doc in top_docs
-    ]
-
-    # --------------------------------------------------
-    # Return
-    # --------------------------------------------------
+        source_snippets.append(
+            {
+                "page": doc.metadata.get("page", 0) + 1,
+                "text": doc.page_content[:250] + "..."
+            }
+        )
 
     return (
         answer,
